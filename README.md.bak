@@ -1,0 +1,168 @@
+Example client-side tests for Hadoop Delegation Token auto-renewal with HBase and HDFS
+
+Token auto-renewal described in:
+* [How to use Hadoop Delegation Token Refresh](https://docs.google.com/document/d/1X-28NcY4fUz-VBUtuuVnpFFFk4Nr5Rtm2cMyc0lNnG4/edit#)
+* [HADOOP-16298](https://issues.apache.org/jira/browse/HADOOP-16298)
+
+To execute the examples here, please see the following tools for manually testing delegation token refresh. Specifically:
+
+* [Tools for Token Acquisition](#tools-for-token-acquisition)
+* [HBase Clients](#hbase-clients) (In this repository)
+* [HDFS Clients](#hdfs-clients) (In this repository)
+
+# Tools for Token Acquisition
+
+To acquire tokens one can use a token acqusition client which minimally supports HDFS, WebHDFS and HBase.
+
+## Hadoop dtutil
+
+One can use `hadoop dtutil` to acquire HDFS and WebHDFS tokens. However, the tool has no way to acquire HBase tokens or acquire tokens for a proxy user. 
+
+With a kerberos ticket:
+```
+kinit
+hadoop dtutil get hdfs://cluster1 -format java hdfs.token
+hadoop dtutil get webhdfs://cluster1 -format java hdfs.token
+```
+
+With a keytab:
+```
+hadoop dtutil -keytab proxy_user.keytab -principal proxy_user@DEV.EXAMPLE.COM get hdfs://cluster1 -format java -renewer proxy_user hdfs.token
+hadoop dtutil -keytab proxy_user.keytab -principal proxy_user@DEV.EXAMPLE.COM get webhdfs://cluster1 -format java -renewer proxy_user hdfs.token
+```
+## Hadoop Token CLI
+
+The [Hadoop Token CLI](https://github.com/cbaenziger/hadoop-token-cli). The project's README is the best documentation on its use but a simple example for the code here is:
+
+```
+while true; do
+  java -cp hadoop-token-cli-0.01-SNAPSHOT-jar-with-dependencies.jar -Dlog4j.configuration=file://`pwd`/log4j.properties com.bloomberg.hi.dtclient.DTGatherer proxy_user@DEV.EXAMPLE.COM `pwd`/proxy_user.keytab $HADOOP_TOKEN_FILE_LOCATION `whoami` hdfs webhdfs hbase
+  sleep 40
+done
+```
+
+# HBase Clients
+
+This repository provides a fetcher which run as a test client to verify delegation tokens are expiring and being renewed properly.
+
+## Server Side Settings
+
+To test delegation token expiry a couple of server settings need to be updated:
+* `hbase.auth.token.max.lifetime`: `60000` (60 seconds)
+
+## Client Side Process
+
+### Running Client
+
+To run a client which will configure HBase to properly test the token refresh functionality and periodially write to a single HBase region in a verifiable way, with logging configured to provide insight to failures, one can launch the test client with the following. Ensure to use EdgeNode to acquire configurations first as it will verify Kerberos tickets which we want to destroy before running tests.
+
+```
+kdestroy
+export TABLE="cbaenzig_test:cbaenzig_renew_test"
+export HADOOP_TOKEN_FILE_LOCATION=`pwd`/clay_token_test
+java \
+  -cp hbase-test-0.1-SNAPSHOT-jar-with-dependencies.jar \
+  -Dlog4j.configuration=file://`pwd`/hbase_test_log4j.properties \
+  -Dlog4j.debug=true com.bloomberg.hi.HBaseTest $TABLE 2>&1 | \
+  grep -v 'Scan: keyvalues' | tee log.txt
+```
+
+### Validation through HBase
+
+It is recommended to read the HBase table being written to ensure writes are landing and no silent failure. One can validate writes by seeing the latest timestamp written to the table with the following loop using EdgeNode configuration and binaries with kerberos credentials:
+
+```
+export TABLE="cbaenzig_test:cbaenzig_renew_test"
+while true; do
+  date --date=@$(hbase shell <<< "scan '$TABLE'" | \
+    grep value= | awk '{print $3}' | \
+    sort -rrn | \
+    head -n1 | \
+    sed 's/timestamp=//;s/[0-9][0-9][0-9],//');
+    sleep 30;
+done
+```
+
+#### Causing Reauthentications
+
+HBase will not need to re-authenticate, if communicating with RegionServers previously communicated with. Past RegionServers connections are held in cache.  To achieve reauthentications to the same cluster in a single JVM instantiation, we need to talk to different RegionServers. To achieve talking to different RegionServers we move the test region around the cluster and ensure the HBase is configured to expire its RegionServer cache faster than regions are moved around.
+
+If one is able to test reading and writing to a single HBase region only, it can aid in testing the expiration and renewal in a very easy way by using a script to movie the region under test to various different region servers in the HBase cluster.
+  
+To ensure HBase region server connections are promptly closed and not held open longer than the lifetime of a delegation token, one needs to set a client-side property `hbase.ipc.client.connection.minIdleTimeBeforeClose` to be less than the lifetime of a delegation token. Testing has so far been performed with this set as low as 10 seconds; the default is 2 minutes which will be too much for testing with the recommended 60 second token expiration. Too long of an expiry configuratoin will result in an application loaded with an expired delegation token appearing to work, as new connections -- requiring authentication -- will not be made to previously contacted (cached) region servers.
+
+A command to aid in HBase region moving can be run via:
+```
+export TABLE="cbaenzig_test:cbaenzig_renew_test"
+java -cp hbase-test-0.1-SNAPSHOT-jar-with-dependencies.jar -Dlog4j.configuration=file://`pwd`/hbase_move_log4j.properties -Dlog4j.debug=true com.bloomberg.hi.HBaseRegionMoverTest $TABLE 60 2>&1
+```
+
+# HDFS Clients
+
+## Server Side Settings
+
+One needs to configure HDFS tokens to expire in a human-scale time if desiring to test token renewal. The server side settings used have been:
+* `dfs.namenode.delegation.token.max-lifetime`: `3600000` (1 hour)
+* `dfs.namenode.delegation.token.renew-interval`: `300000` (5 minutes)
+* `dfs.namenode.delegation.key.update-interval`: `300000` (5 minutes)
+* `dfs.block.access.token.lifetime`: `5` (5 minutes)
+* `dfs.block.access.key.update.interval`: `5` (5 minutes)
+
+## Client Side Process
+
+### Token Fetching
+For a standalone Java process one can run the Hadoop Token CLI to periodically reacquire delegation tokens:
+
+```
+while true; do
+  hadoop-token-cli-0.01-SNAPSHOT-jar-with-dependencies.jar com.bloomberg.hi.dtclient.DTGatherer proxy_user@DEV.EXAMPLE.COM `pwd`/proxy_user.keytab $HADOOP_TOKEN_FILE_LOCATION `whoami` hdfs webhdfs hbase 
+done
+```
+
+### HDFS Writer
+
+A simple program which will ensure HDSF file system objects are closed, reaped out of cache and reestablished on a continual basis can be run as follows:
+
+```
+export HADOOP_TOKEN_FILE_LOCATION=`pwd`/clay_token_test
+export TEST_DIR=/tmp/foo
+java -cp hbase-test-0.1-SNAPSHOT-jar-with-dependencies.jar -Dlog4j.configuration=file://`pwd`/hdfs_test_log4j.properties  -Dlog4j.debug=true com.bloomberg.hi.HDFSTest $TEST_DIR 2>&1
+```
+
+### Validation through HDFS Commandline
+
+One can ensure the writes are continuing with the following HDFS command which should show recent times as one bounces NameNodes and DataNodes:
+```
+export TEST_DIR=/tmp/foo
+hdfs dfs -cat ${TEST_DIR}/append_file | tail
+```
+
+### Testing Multiple HDFSes in one JVM
+
+To test token reload while communicating to multiple HDFSes one can use `hadoop dtutil append` to merge tokens formultiple HDFS clusters:
+
+```
+while true; do
+    HADOOP_CONF_DIR=`pwd`/cluster1 HBASE_CONF_DIR=`pwd`/cluster1 java -cp hadoop-token-cli-0.01-SNAPSHOT-jar-with-dependencies.jar com.bloomberg.hi.dtclient.DTGatherer proxy_user@DEV.EXAMPLE.COM `pwd`/proxy_user.keytab test_token1 cbaenzig hdfs webhdfs hbase &
+    HADOOP_CONF_DIR=`pwd`/cluster2 HBASE_CONF_DIR=`pwd`/cluster2 java -cp hadoop-token-cli-0.01-SNAPSHOT-jar-with-dependencies.jar com.bloomberg.hi.dtclient.DTGatherer proxy_user@DEV.EXAMPLE.COM `pwd`/proxy_user.keytab test_token2 cbaenzig hdfs webhdfs hbase &
+    wait
+    hadoop dtutil append -format protobuf cluster1 cluster2
+    # ensure to update the token atomically so that we don't have a token with only one cluster's credentials at reload time
+    cp cluster2 $HADOOP_TOKEN_FILE_LOCATION
+    sleep 10
+done
+```
+
+To run the HDFS test for multiple HDFSes one can run the following:
+```
+export HADOOP_TOKEN_FILE_LOCATION=`pwd`/clay_token_test
+export TEST_DIR=/tmp/foo
+HADOOP_CONF_DIR1=`pwd`/cluster1 HADOOP_CONF_DIR2=`pwd`/cluster1 
+java -cp hbase-test-0.1-SNAPSHOT-jar-with-dependencies.jar -Dlog4j.configuration=file://`pwd`/hdfs_test_log4j.properties  -Dlog4j.debug=true com.bloomberg.hi.HDFSTest $TEST_DIR 2>&1
+```
+
+The code will try to extract the file system configurations out from the two configuration directories itself; no need to specify a master `hdfs-site.xml`.
+
+# Building
+
+Building is a simple affair with `mvn package` however one will want to supply a suitable Hadoop version to build against in the `pom.xml` as at this time [HADOOP-16298](https://issues.apache.org/jira/browse/HADOOP-16298) is not yet merged.
